@@ -7,6 +7,7 @@ from selenium.webdriver.common.by import By
 from webdriver_manager.chrome import ChromeDriverManager
 from st_aggrid import AgGrid, GridOptionsBuilder
 import time
+import os
 
 st.set_page_config(page_title="Proton Production Traceability", layout="wide")
 
@@ -24,16 +25,31 @@ LINE_URLS = {
 }
 
 def get_driver():
+    """Configures Chrome for Streamlit Cloud and local environments."""
     options = Options()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
-    return webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+    options.add_argument("--disable-gpu")
+    
+    # Check if running on Streamlit Cloud
+    if os.path.exists("/usr/bin/chromium"):
+        options.binary_location = "/usr/bin/chromium"
+        
+    try:
+        # Use ChromeDriverManager to automatically handle the driver
+        driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
+        return driver
+    except Exception as e:
+        st.error(f"Failed to start browser: {e}")
+        return None
 
 def scrape_line_data(selected_lines):
     driver = get_driver()
+    if not driver:
+        return pd.DataFrame()
+        
     all_data = []
-    
     status_text = st.empty()
     bar = st.progress(0)
     
@@ -43,12 +59,13 @@ def scrape_line_data(selected_lines):
         
         try:
             driver.get(url)
-            time.sleep(8) # Wait for Vue.js to populate the table results
+            # Increased sleep to ensure Vue.js renders all data
+            time.sleep(10) 
             
             rows = driver.find_elements(By.TAG_NAME, "tr")
             for row in rows:
                 cells = row.find_elements(By.CLASS_NAME, "text-start")
-                # Cells map: 0=Status, 2=Controller Name, 5=VIN
+                # Cells map: 0=Status, 2=Controller, 5=VIN
                 if len(cells) >= 6:
                     all_data.append({
                         "Line": line_name,
@@ -66,12 +83,12 @@ def scrape_line_data(selected_lines):
 
 # --- UI INTERFACE ---
 st.title("🛡️ Proton Global Traceability Matrix")
-st.sidebar.header("Scan Configuration")
+st.sidebar.header("Audit Setup")
 
 selected_lines = st.sidebar.multiselect(
     "Select Production Lines to Audit:", 
     options=list(LINE_URLS.keys()),
-    default=["Trim", "Final", "Chassis"]
+    default=["Trim", "Final"]
 )
 
 if st.button("Run Global Cross-Check"):
@@ -82,7 +99,6 @@ if st.button("Run Global Cross-Check"):
         
         if not df.empty:
             # Create Pivot: VIN (Y) vs Controller (X)
-            # Use 'Status' as the value (OK/NOK/Torque value)
             matrix = df.pivot_table(
                 index='VIN', 
                 columns=['Line', 'Controller'], 
@@ -91,9 +107,8 @@ if st.button("Run Global Cross-Check"):
             ).reset_index()
 
             st.subheader("📊 Production Integrity Matrix")
-            st.info("Missing cells (Red/NaN) indicate a VIN that was never recorded at that station.")
-
-            # Display with AgGrid
+            
+            # Setup AgGrid for Excel-like filtering
             gb = GridOptionsBuilder.from_dataframe(matrix)
             gb.configure_default_column(resizable=True, filterable=True, sortable=True)
             grid_options = gb.build()
@@ -101,16 +116,15 @@ if st.button("Run Global Cross-Check"):
 
             # --- GAP REPORT ---
             st.subheader("🚨 Detected Gaps")
-            # Calculate missing stations per VIN
             missing_data = matrix[matrix.isnull().any(axis=1)]
+            
             if not missing_data.empty:
-                st.error(f"CRITICAL: {len(missing_data)} VINs have missing torque data!")
-                st.dataframe(missing_data.style.highlight_null(null_color='red'))
+                st.error(f"Found {len(missing_data)} VINs with missing torque records.")
+                st.dataframe(missing_data.style.highlight_null(null_color='#ff4b4b'))
                 
                 csv = missing_data.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Gap Report", csv, "traceability_gaps.csv")
+                st.download_button("📥 Download Gap Report (CSV)", csv, "traceability_gaps.csv")
             else:
-                st.success("All VINs cleared! 100% Traceability achieved.")
-
+                st.success("100% Traceability achieved for selected lines.")
         else:
-            st.error("Connection failed. Ensure you are on the Proton Office/Factory Network.")
+            st.error("No data retrieved. Verify that the PC running this app has access to 10.200.28.208.")
