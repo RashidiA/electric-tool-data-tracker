@@ -11,7 +11,6 @@ import os
 
 st.set_page_config(page_title="Proton Production Traceability", layout="wide")
 
-# --- MAPPING THE LINES ---
 LINE_URLS = {
     "Trim": "http://10.200.28.208/dashboards/#/?dashboard=53f11920-e1af-11ee-a41a-194721b4211b&period=today&lineLayoutItem=ae96d860-bf59-11ee-bc35-29118d9fcb94",
     "Final": "http://10.200.28.208/dashboards/#/?dashboard=53f11920-e1af-11ee-a41a-194721b4211b&period=today&lineLayoutItem=6177cda0-bf59-11ee-bc35-29118d9fcb94",
@@ -25,29 +24,28 @@ LINE_URLS = {
 }
 
 def get_driver():
-    """Configures Chrome for Streamlit Cloud and local environments."""
     options = Options()
     options.add_argument("--headless")
     options.add_argument("--no-sandbox")
     options.add_argument("--disable-dev-shm-usage")
     options.add_argument("--disable-gpu")
+    options.add_argument("--mute-audio") # Avoids libasound issues
     
-    # Check if running on Streamlit Cloud
     if os.path.exists("/usr/bin/chromium"):
         options.binary_location = "/usr/bin/chromium"
+    elif os.path.exists("/usr/bin/chromium-browser"):
+        options.binary_location = "/usr/bin/chromium-browser"
         
     try:
-        # Use ChromeDriverManager to automatically handle the driver
         driver = webdriver.Chrome(service=Service(ChromeDriverManager().install()), options=options)
         return driver
     except Exception as e:
-        st.error(f"Failed to start browser: {e}")
+        st.error(f"Chromium Init Failed: {e}")
         return None
 
 def scrape_line_data(selected_lines):
     driver = get_driver()
-    if not driver:
-        return pd.DataFrame()
+    if not driver: return pd.DataFrame()
         
     all_data = []
     status_text = st.empty()
@@ -56,16 +54,12 @@ def scrape_line_data(selected_lines):
     for i, line_name in enumerate(selected_lines):
         url = LINE_URLS[line_name]
         status_text.text(f"🚀 Scanning {line_name} Line...")
-        
         try:
             driver.get(url)
-            # Increased sleep to ensure Vue.js renders all data
-            time.sleep(10) 
-            
+            time.sleep(12) # Increased wait for 36k+ results
             rows = driver.find_elements(By.TAG_NAME, "tr")
             for row in rows:
                 cells = row.find_elements(By.CLASS_NAME, "text-start")
-                # Cells map: 0=Status, 2=Controller, 5=VIN
                 if len(cells) >= 6:
                     all_data.append({
                         "Line": line_name,
@@ -75,56 +69,34 @@ def scrape_line_data(selected_lines):
                     })
         except Exception as e:
             st.error(f"Error on {line_name}: {e}")
-        
         bar.progress((i + 1) / len(selected_lines))
     
     driver.quit()
     return pd.DataFrame(all_data)
 
-# --- UI INTERFACE ---
 st.title("🛡️ Proton Global Traceability Matrix")
-st.sidebar.header("Audit Setup")
 
-selected_lines = st.sidebar.multiselect(
-    "Select Production Lines to Audit:", 
-    options=list(LINE_URLS.keys()),
-    default=["Trim", "Final"]
-)
+selected_lines = st.multiselect("Select Lines to Audit:", options=list(LINE_URLS.keys()), default=["Trim", "Final"])
 
 if st.button("Run Global Cross-Check"):
     if not selected_lines:
         st.warning("Please select at least one line.")
     else:
         df = scrape_line_data(selected_lines)
-        
         if not df.empty:
-            # Create Pivot: VIN (Y) vs Controller (X)
-            matrix = df.pivot_table(
-                index='VIN', 
-                columns=['Line', 'Controller'], 
-                values='Status', 
-                aggfunc='first'
-            ).reset_index()
-
+            matrix = df.pivot_table(index='VIN', columns=['Line', 'Controller'], values='Status', aggfunc='first').reset_index()
             st.subheader("📊 Production Integrity Matrix")
-            
-            # Setup AgGrid for Excel-like filtering
             gb = GridOptionsBuilder.from_dataframe(matrix)
             gb.configure_default_column(resizable=True, filterable=True, sortable=True)
-            grid_options = gb.build()
-            AgGrid(matrix, gridOptions=grid_options, height=500, theme='alpine')
+            AgGrid(matrix, gridOptions=gb.build(), height=500, theme='alpine')
 
-            # --- GAP REPORT ---
             st.subheader("🚨 Detected Gaps")
             missing_data = matrix[matrix.isnull().any(axis=1)]
-            
             if not missing_data.empty:
-                st.error(f"Found {len(missing_data)} VINs with missing torque records.")
+                st.error(f"Missing data for {len(missing_data)} VINs.")
                 st.dataframe(missing_data.style.highlight_null(null_color='#ff4b4b'))
-                
-                csv = missing_data.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Gap Report (CSV)", csv, "traceability_gaps.csv")
+                st.download_button("📥 Download Gap Report", missing_data.to_csv(index=False).encode('utf-8'), "gaps.csv")
             else:
-                st.success("100% Traceability achieved for selected lines.")
+                st.success("All VINs clear!")
         else:
-            st.error("No data retrieved. Verify that the PC running this app has access to 10.200.28.208.")
+            st.error("No data found. Check VPN/Intranet connection to 10.200.28.208.")
