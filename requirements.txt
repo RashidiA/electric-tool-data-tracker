@@ -2,4 +2,6 @@ streamlit
 pandas
 selenium
 webdriver-manager
-st-aggrid
+streamlit-autorefresh
+lxml
+jinja2
