@@ -1,18 +1,15 @@
 import streamlit as st
 import pandas as pd
 from selenium import webdriver
-from selenium.webdriver.chrome.service import Service
 from selenium.webdriver.chrome.options import Options
-from selenium.webdriver.common.by import By
-from webdriver_manager.chrome import ChromeDriverManager
-from st_aggrid import AgGrid, GridOptionsBuilder
+from streamlit_autorefresh import st_autorefresh
 import time
-import os
-from datetime import datetime
 
-st.set_page_config(page_title="Proton Production Traceability", layout="wide")
+st.set_page_config(page_title="Proton VIN Traceability", layout="wide")
+st_autorefresh(interval=60000, key="datarefresh") # Refresh every 60 seconds
 
-LINE_URLS = {
+# Dictionary of all 70++ Controller Groups
+DASHBOARDS = {
     "Trim": "http://10.200.28.208/dashboards/#/?dashboard=53f11920-e1af-11ee-a41a-194721b4211b&period=today&lineLayoutItem=ae96d860-bf59-11ee-bc35-29118d9fcb94",
     "Final": "http://10.200.28.208/dashboards/#/?dashboard=53f11920-e1af-11ee-a41a-194721b4211b&period=today&lineLayoutItem=6177cda0-bf59-11ee-bc35-29118d9fcb94",
     "Chassis": "http://10.200.28.208/dashboards/#/?dashboard=53f11920-e1af-11ee-a41a-194721b4211b&period=today&lineLayoutItem=c2240880-bf59-11ee-bc35-29118d9fcb94",
@@ -24,117 +21,61 @@ LINE_URLS = {
     "New Project": "http://10.200.28.208/dashboards/#/?dashboard=53f11920-e1af-11ee-a41a-194721b4211b&period=today&lineLayoutItem=3aa286c0-cdd6-11ef-be03-2107e4aeaf7d"
 }
 
-def get_driver():
-    options = Options()
-    options.add_argument("--headless")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--mute-audio")
+def scrape_all_dashboards():
+    chrome_options = Options()
+    chrome_options.add_argument("--headless") # Run without opening a window
+    driver = webdriver.Chrome(options=chrome_options)
     
-    # Path logic for Streamlit Cloud vs Local
-    if os.path.exists("/usr/bin/chromium"):
-        options.binary_location = "/usr/bin/chromium"
-    elif os.path.exists("/usr/bin/chromium-browser"):
-        options.binary_location = "/usr/bin/chromium-browser"
-        
-    try:
-        service = Service(ChromeDriverManager().install())
-        driver = webdriver.Chrome(service=service, options=options)
-        driver.set_page_load_timeout(30)
-        return driver
-    except Exception as e:
-        st.error(f"Chromium Init Failed: {e}")
-        return None
-
-def scrape_line_data(selected_lines):
-    driver = get_driver()
-    if not driver: return pd.DataFrame()
-        
     all_data = []
-    status_text = st.empty()
-    bar = st.progress(0)
     
-    for i, line_name in enumerate(selected_lines):
-        url = LINE_URLS[line_name]
-        status_text.text(f"🚀 Scanning {line_name} Line (Collecting records)...")
+    for section, url in DASHBOARDS.items():
         try:
             driver.get(url)
-            # Higher wait time for large factory datasets to finish rendering
-            time.sleep(15) 
-            
-            rows = driver.find_elements(By.TAG_NAME, "tr")
-            for row in rows:
-                cells = row.find_elements(By.CLASS_NAME, "text-start")
-                if len(cells) >= 6:
-                    all_data.append({
-                        "Line": line_name,
-                        "Controller": cells[2].text.strip(),
-                        "VIN": cells[5].text.strip(),
-                        "Status": cells[0].text.strip(),
-                        "Timestamp": datetime.now().strftime("%Y-%m-%d %H:%M")
-                    })
+            time.sleep(3) # Wait for JS to load torque data
+            html = driver.page_source
+            tables = pd.read_html(html)
+            if tables:
+                df = tables[0]
+                df['Section'] = section # Track which line the data came from
+                all_data.append(df)
         except Exception as e:
-            st.error(f"Error on {line_name}: {e}")
-        bar.progress((i + 1) / len(selected_lines))
-    
+            st.error(f"Error scraping {section}: {e}")
+            
     driver.quit()
-    return pd.DataFrame(all_data)
+    return pd.concat(all_data, ignore_index=True) if all_data else None
 
-# --- UI LAYOUT ---
-st.title("🛡️ Proton Global Traceability Matrix")
-st.markdown(f"**Current Session:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+st.title("🚗 Proton Production VIN Traceability Matrix")
+st.info("Status: Live Monitoring (Auto-refresh 60s)")
 
-selected_lines = st.multiselect("Select Lines to Audit:", options=list(LINE_URLS.keys()), default=["Trim", "Final"])
+raw_df = scrape_all_dashboards()
 
-if st.button("Run Global Cross-Check"):
-    if not selected_lines:
-        st.warning("Please select at least one line.")
-    else:
-        with st.spinner("Processing Large Dataset... Please wait."):
-            df = scrape_line_data(selected_lines)
-            
-        if not df.empty:
-            # PIVOT LOGIC: VIN is Y-axis, Controller is X-axis
-            matrix = df.pivot_table(
-                index='VIN', 
-                columns=['Line', 'Controller'], 
-                values='Status', 
-                aggfunc='first'
-            ).reset_index()
+if raw_df is not None:
+    # 1. Pivot the data to create the Matrix
+    # We assume columns in dashboard are: 'VIN', 'Controller Name', 'Torque (Nm)'
+    try:
+        matrix = raw_df.pivot_table(index='VIN', 
+                                    columns='Controller Name', 
+                                    values='Torque (Nm)', 
+                                    aggfunc='first')
 
-            # --- METRICS ---
-            col1, col2, col3 = st.columns(3)
-            col1.metric("Total VINs Tracked", len(matrix))
-            col2.metric("Controllers Audited", len(df['Controller'].unique()))
-            
-            # --- MAIN DATA TABLE ---
-            st.subheader("📊 Production Integrity Matrix")
-            gb = GridOptionsBuilder.from_dataframe(matrix)
-            gb.configure_default_column(resizable=True, filterable=True, sortable=True)
-            gb.configure_side_bar() # Adds a sidebar to the table for better filtering
-            
-            AgGrid(matrix, gridOptions=gb.build(), height=500, theme='alpine', enable_enterprise_modules=False)
+        # 2. Visual Styling: Red for Missing (NaN)
+        def style_missing(val):
+            return 'background-color: #ffcccc' if pd.isna(val) else ''
 
-            # --- GAP ANALYSIS ---
-            st.subheader("🚨 Detected Gaps")
-            missing_data = matrix[matrix.isnull().any(axis=1)]
-            
-            if not missing_data.empty:
-                st.error(f"Alert: {len(missing_data)} VINs have missing torque data at one or more stations.")
-                st.dataframe(missing_data.style.highlight_null(null_color='#ff4b4b'))
-                
-                # Combined Download
-                csv_gaps = missing_data.to_csv(index=False).encode('utf-8')
-                st.download_button("📥 Download Gap Report", csv_gaps, "traceability_gaps.csv", "text/csv")
-            else:
-                st.success("Perfect Integrity! All VINs accounted for across all selected lines.")
-                
-            # Full Data Download
-            csv_full = matrix.to_csv(index=False).encode('utf-8')
-            st.download_button("📂 Download Full Matrix", csv_full, "full_traceability.csv", "text/csv")
+        st.subheader("Data Matrix (Scroll Right for all 70+ Controllers)")
+        st.dataframe(matrix.style.applymap(style_missing), use_container_width=True)
+
+        # 3. Analytics: Find Missing VINs
+        st.divider()
+        st.subheader("⚠️ Missing Torque Data Summary")
+        missing_mask = matrix.isna().any(axis=1)
+        missing_vins = matrix[missing_mask]
+        
+        if not missing_vins.empty:
+            st.warning(f"Found {len(missing_vins)} VINs with incomplete controller data.")
+            st.write(missing_vins)
         else:
-            st.error("Connection Failed. Are you on the Proton Intranet? (Target: 10.200.28.208)")
+            st.success("All current VINs have complete torque data across all stations.")
 
-st.sidebar.markdown("---")
-st.sidebar.caption("System developed for industrial data tracking and VIN traceability automation.")
+    except KeyError as e:
+        st.error(f"Column name mismatch. Found: {list(raw_df.columns)}. Expected 'VIN', 'Controller Name', 'Torque (Nm)'")
